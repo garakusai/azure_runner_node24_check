@@ -1,0 +1,246 @@
+name: repro-node24-canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      waves:
+        description: "How many waves of fresh VMs to sample"
+        required: false
+        default: "3"
+      slots:
+        description: "How many jobs per wave"
+        required: false
+        default: "24"
+      max_parallel:
+        description: "Maximum concurrent jobs"
+        required: false
+        default: "8"
+  schedule:
+    - cron: "17 18 * * *" # JST 03:17
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+      max_parallel: ${{ steps.mk.outputs.max_parallel }}
+      waves: ${{ steps.mk.outputs.waves }}
+      slots: ${{ steps.mk.outputs.slots }}
+    steps:
+      - name: Build matrix
+        id: mk
+        shell: bash
+        env:
+          WAVES: ${{ github.event.inputs.waves || '3' }}
+          SLOTS: ${{ github.event.inputs.slots || '24' }}
+          MAX_PARALLEL: ${{ github.event.inputs.max_parallel || '8' }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+
+          waves = int(os.environ["WAVES"])
+          slots = int(os.environ["SLOTS"])
+          max_parallel = int(os.environ["MAX_PARALLEL"])
+
+          include = []
+          for wave in range(1, waves + 1):
+              for slot in range(1, slots + 1):
+                  include.append({
+                      "wave": wave,
+                      "slot": slot,
+                      "job_key": f"w{wave:02d}-s{slot:02d}"
+                  })
+
+          print(f"matrix={json.dumps({'include': include}, separators=(',', ':'))}")
+          print(f"max_parallel={max_parallel}")
+          print(f"waves={waves}")
+          print(f"slots={slots}")
+          PY
+
+      - name: Show plan
+        shell: bash
+        run: |
+          echo "waves=${{ steps.mk.outputs.waves }}"
+          echo "slots=${{ steps.mk.outputs.slots }}"
+          echo "max_parallel=${{ steps.mk.outputs.max_parallel }}"
+          echo '${{ steps.mk.outputs.matrix }}'
+
+  probe:
+    name: probe-${{ matrix.job_key }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.prepare.outputs.max_parallel) }}
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - name: Create probe file
+        shell: bash
+        run: |
+          {
+            echo "job_key=${{ matrix.job_key }}"
+            echo "wave=${{ matrix.wave }}"
+            echo "slot=${{ matrix.slot }}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "job=${GITHUB_JOB}"
+            echo "workflow=${GITHUB_WORKFLOW}"
+            echo "ref=${GITHUB_REF}"
+            echo "sha=${GITHUB_SHA}"
+          } > probe.txt
+
+      - name: Probe runner node24 / externals
+        id: probe
+        shell: bash
+        run: |
+          set +e
+
+          CACHED_ROOT=/home/runner/actions-runner/cached
+          CURRENT_DIR="$(find "$CACHED_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V | tail -n1)"
+          RUNNER_DIR="$CACHED_ROOT/$CURRENT_DIR"
+          EXTERNALS="$RUNNER_DIR/externals"
+          NODE24_BIN="$EXTERNALS/node24/bin"
+          NODE24="$NODE24_BIN/node"
+
+          REPORT="probe-report-${{ matrix.job_key }}.log"
+
+          {
+            echo "job_key=${{ matrix.job_key }}"
+            echo "wave=${{ matrix.wave }}"
+            echo "slot=${{ matrix.slot }}"
+            echo "RUNNER_OS=$RUNNER_OS"
+            echo "RUNNER_ARCH=$RUNNER_ARCH"
+            echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+            echo "PWD=$(pwd)"
+            echo "CACHED_ROOT=$CACHED_ROOT"
+            echo "CURRENT_DIR=$CURRENT_DIR"
+            echo "RUNNER_DIR=$RUNNER_DIR"
+
+            echo
+            echo "=== cached root ==="
+            ls -la "$CACHED_ROOT" || true
+
+            echo
+            echo "=== cached subdirs ==="
+            find "$CACHED_ROOT" -maxdepth 2 -type d | sort || true
+
+            echo
+            echo "=== runner dir ==="
+            ls -la "$RUNNER_DIR" || true
+
+            echo
+            echo "=== externals entry ==="
+            ls -ld "$EXTERNALS" || true
+
+            echo
+            echo "=== externals symlink target ==="
+            readlink "$EXTERNALS" || true
+            readlink -f "$EXTERNALS" || true
+
+            echo
+            echo "=== /opt/runner-cache ==="
+            ls -ld /opt/runner-cache || true
+            ls -la /opt/runner-cache || true
+
+            echo
+            echo "=== /opt/runner-cache/externals ==="
+            ls -ld /opt/runner-cache/externals || true
+            ls -la /opt/runner-cache/externals || true
+
+            echo
+            echo "=== /opt/runner-cache/externals/node24 ==="
+            ls -ld /opt/runner-cache/externals/node24 || true
+            ls -la /opt/runner-cache/externals/node24 || true
+
+            echo
+            echo "=== node24 bin ==="
+            ls -la "$NODE24_BIN" || true
+
+            echo
+            echo "=== node24 executable ==="
+            stat "$NODE24" || true
+
+            echo
+            echo "=== node24 version ==="
+            "$NODE24" --version || true
+          } | tee "$REPORT"
+
+          if [ -x "$NODE24" ]; then
+            echo "node24_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "node24_ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger upload-artifact@v7
+        id: upload
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: repro-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.job_key }}
+          path: probe.txt
+          if-no-files-found: error
+
+      - name: Emit compact result
+        if: always()
+        shell: bash
+        run: |
+          echo "RESULT job_key=${{ matrix.job_key }} node24_ok=${{ steps.probe.outputs.node24_ok }} upload_outcome=${{ steps.upload.outcome }} upload_conclusion=${{ steps.upload.conclusion }}"
+
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## probe-${{ matrix.job_key }}"
+            echo
+            echo "- node24_ok: \`${{ steps.probe.outputs.node24_ok }}\`"
+            echo "- upload outcome: \`${{ steps.upload.outcome }}\`"
+            echo "- upload conclusion: \`${{ steps.upload.conclusion }}\`"
+            echo "- note: Cloud / Region / Runner Image Version は Set up job を確認"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if probe detected the issue
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.probe.outputs.node24_ok }}" != "true" ]; then
+            echo "node24 runtime missing"
+            exit 1
+          fi
+
+          if [ "${{ steps.upload.outcome }}" != "success" ]; then
+            echo "upload-artifact@v7 failed"
+            exit 1
+          fi
+
+  conclusion:
+    name: conclusion
+    if: always()
+    needs: [prepare, probe]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Final note
+        shell: bash
+        run: |
+          {
+            echo "## Final note"
+            echo
+            echo "- waves: ${{ needs.prepare.outputs.waves }}"
+            echo "- slots per wave: ${{ needs.prepare.outputs.slots }}"
+            echo "- max_parallel: ${{ needs.prepare.outputs.max_parallel }}"
+            echo "- If any probe job failed, inspect that job's **Set up job** section for Cloud / Region / Runner Image Version."
+            echo "- Compare successful vs failed jobs for:"
+            echo "  - Cloud / Region"
+            echo "  - Runner Image Version"
+            echo "  - Hosted Compute Agent Version"
+            echo "  - externals being a real directory vs symlink"
+            echo "  - presence of /opt/runner-cache/externals/node24/bin/node"
+          } >> "$GITHUB_STEP_SUMMARY"
+
