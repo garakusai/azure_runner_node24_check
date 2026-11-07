@@ -1,0 +1,8 @@
+name: call other workflow
+
+on:
+  workflow_dispatch:
+
+jobs:
+  call-build:
+    uses: ./.github/workflows/repro-node24-externals.yml
