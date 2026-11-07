@@ -2,6 +2,7 @@ name: repro-node24-externals
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 jobs:
   probe:
